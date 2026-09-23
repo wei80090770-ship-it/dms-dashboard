@@ -119,17 +119,31 @@ function capacityAction(tplh,d25,thirdPct,lateAssign,lateArrive,waitRate,targets
 function thirdTargetValue(){let v=parseFloat($('thirdTarget')?.value);return Number.isFinite(v)?v:25}
 function mergeRecForOrders(z,targets){
  let own=z.filter(x=>x.type==='own'), groups=mergeGroups(own), cur=groups.length?own.length/groups.length:null, d=d25Rate(own), wait=avg(own,'storeWait'), dist=avg(own,'distance');
- // 訂單資料驅動的「建議最大併單數」：先看30分鐘訂單密度，再用D25/等餐/距離風險下修；不是保證結果。
- let rec=own.length>=12?4:own.length>=7?3:own.length>=3?2:1;
- if(Number.isFinite(d)&&d<targets.d25) rec=Math.min(rec,2);
- if(Number.isFinite(wait)&&wait>7) rec=Math.min(rec,2);
- if(Number.isFinite(dist)&&dist>3) rec=Math.min(rec,2);
- if(Number.isFinite(d)&&d<targets.d25-8) rec=1;
- // 已觀察到的併單層級若D25達標，可作為最低可支持層級。
- let stats=mergeSizeRows(z), safe=stats.map((x,i)=>({size:i+1,...x})).filter(x=>x.trips>0&&Number.isFinite(x.d25)&&x.d25>=targets.d25);
- if(safe.length){let observed=Math.max(...safe.map(x=>x.size));rec=Math.max(rec,Math.min(observed,4));}
- let risk=[];if(Number.isFinite(d)&&d<targets.d25)risk.push('D25承壓');if(Number.isFinite(wait)&&wait>7)risk.push('等餐偏高');if(Number.isFinite(dist)&&dist>3)risk.push('距離偏長');if(!risk.length)risk.push('訂單結構可承接');
- return{rec,cur,d25:d,wait,dist,own:own.length,risk:risk.join('、')};
+ // KPI改善型建議：2單是正常管理基準，不因歷史多為單送就建議1單。
+ // 只有明確的D25/等餐/長距離風險才降為1單；訂單密度與實績支持時再提高到3~4單。
+ let rec=2;
+ let severeD25=Number.isFinite(d)&&d<targets.d25-8;
+ let severeWait=Number.isFinite(wait)&&wait>10;
+ let severeDist=Number.isFinite(dist)&&dist>4;
+ if(severeD25&&(severeWait||severeDist)) rec=1;
+ else {
+   if(own.length>=7) rec=3;
+   if(own.length>=12) rec=4;
+   if(Number.isFinite(d)&&d<targets.d25) rec=Math.min(rec,2);
+   if(Number.isFinite(wait)&&wait>7) rec=Math.min(rec,2);
+   if(Number.isFinite(dist)&&dist>3) rec=Math.min(rec,2);
+ }
+ // 實際已觀察到更高併單且D25達標，可提高建議上限；最多先到4單。
+ let stats=mergeSizeRows(z), safe=stats.map((x,i)=>({size:i+1,...x})).filter(x=>x.size>=2&&x.trips>0&&Number.isFinite(x.d25)&&x.d25>=targets.d25);
+ if(safe.length&&!severeD25){let observed=Math.max(...safe.map(x=>x.size));rec=Math.max(rec,Math.min(observed,4));}
+ let risk=[];
+ if(rec===1)risk.push('目前有明確風險，先單送保護D25');
+ else if(rec===2&&cur!==null&&cur<2)risk.push('以2單為改善基準，優先創造合適併單提升TPLH');
+ else risk.push('在守住D25下提高每趟承載');
+ if(Number.isFinite(d)&&d<targets.d25)risk.push('D25承壓');
+ if(Number.isFinite(wait)&&wait>7)risk.push('等餐偏高');
+ if(Number.isFinite(dist)&&dist>3)risk.push('距離偏長');
+ return{rec,cur,d25:d,wait,dist,own:own.length,risk:risk.join('；')};
 }
 function thirdPartyDecision(z,mergeRec,targets){
  let third=z.filter(x=>x.type==='third').length, rate=pct(third,z.length), own=z.filter(x=>x.type==='own'), d=d25Rate(own), meal=mealPeriod((z[0]?.originalEta||z[0]?.orderTime)), tt=thirdTargetValue();
@@ -152,7 +166,7 @@ function renderCapacity(){
  let summary=thirdPct>tt?`整日第三方 ${fmt(thirdPct)}%，高於 ${fmt(tt)}% 目標；約需把 ${dailyGap} TC 從第三方轉回OWN才可回到目標內。系統會優先找「餐期D25達標＋仍有併單空間」的時段，不會因下午茶/宵夜第三方偏高就要求加人。`:`整日第三方 ${fmt(thirdPct)}%，目前在 ${fmt(tt)}% 目標內；非餐期可維持低人力＋第三方策略，餐期則優先用併單提升OWN承載。`;
  $('capacity').innerHTML=`<div class="grid kpis compact"><div class="card kpi"><div class="label">自有外送 TC</div><div class="value">${own.length.toLocaleString()}</div><div class="detail">目前篩選範圍</div></div><div class="card kpi"><div class="label">併單率</div><div class="value">${fmt(mergeStats(data).mergeRate)}%</div><div class="detail">併單訂單 TC ÷ OWN TC</div></div><div class="card kpi"><div class="label">平均併單數</div><div class="value">${fmt(mergeStats(data).avgMerge)}</div><div class="detail">單 / 併單趟</div></div><div class="card kpi"><div class="label">3rd%</div><div class="value ${thirdPct>tt?'bad':'good'}">${fmt(thirdPct)}%</div><div class="detail">整日目標 &lt; ${fmt(tt)}%</div></div></div>
  <div class="card section"><div class="opportunity"><b>${esc(summary)}</b></div></div>
- <div class="card section"><h2>30分鐘 × 區域：建議最大併單數</h2><div class="note">先看時段，再看各區域。每格是「有合適訂單時的建議最大併單數」，不是要求低單量餐廳硬等湊單。區域目前依報表 AC 欄位呈現；餐廳差異請看下一張表。</div><div class="tablewrap"><table><thead><tr><th>時段</th>${areas.map(a=>`<th>${esc(a)}</th>`).join('')}</tr></thead><tbody>${matrix.map(r=>`<tr><td><b>${r.time}–${(()=>{let[h,m]=r.time.split(':').map(Number),d=new Date(2000,0,1,h,m+30);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')})()}</b></td>${areas.map(a=>{let c=r.cells[a];if(!c)return'<td>-</td>';return`<td style="text-align:left;min-width:145px"><b>建議 ${c.mr.rec} 單</b><br><span class="mini">${esc(c.tp.label)}</span></td>`}).join('')}</tr>`).join('')}</tbody></table></div></div>
+ <div class="card section"><h2>30分鐘 × 區域：建議最大併單數</h2><div class="note">先看時段，再看各區域。以 KPI 改善為目的：正常以 2 單為基本目標；只有明確 D25／等餐／長距離風險才降為 1 單，訂單密度與實績支持時提高到 3–4 單。建議值是上限，不是要求等單湊滿。區域目前依報表 AC 欄位呈現。</div><div class="tablewrap"><table><thead><tr><th>時段</th>${areas.map(a=>`<th>${esc(a)}</th>`).join('')}</tr></thead><tbody>${matrix.map(r=>`<tr><td><b>${r.time}–${(()=>{let[h,m]=r.time.split(':').map(Number),d=new Date(2000,0,1,h,m+30);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')})()}</b></td>${areas.map(a=>{let c=r.cells[a];if(!c)return'<td>-</td>';return`<td style="text-align:left;min-width:145px"><b>建議 ${c.mr.rec} 單</b><br><span class="mini">${esc(c.tp.label)}</span></td>`}).join('')}</tr>`).join('')}</tbody></table></div></div>
  <div class="card section"><h2>餐廳例外：同區域不同餐廳怎麼併</h2><div class="note">只顯示決策需要的資訊。建議值代表有合適訂單時的上限，低單量餐廳不需要等單湊滿。</div><div class="tablewrap"><table><thead><tr><th>時段</th><th>區域</th><th>餐廳</th><th>OWN TC</th><th>3rd%</th><th>目前併單</th><th>建議併單</th><th>D25</th><th>判斷</th></tr></thead><tbody>${storeRows.sort((a,b)=>a.time.localeCompare(b.time)||b.z.length-a.z.length).map(r=>`<tr><td>${r.time}</td><td>${esc(r.area)}</td><td><b>${esc(r.store)}</b></td><td>${r.mr.own}</td><td>${fmt(pct(r.z.filter(x=>x.type==='third').length,r.z.length))}%</td><td>${fmt(r.mr.cur)}</td><td><b>${r.mr.rec} 單</b></td><td>${fmt(r.mr.d25)}%</td><td style="text-align:left;white-space:normal;min-width:280px">${esc(r.mr.risk)}；${esc(r.tp.label)}</td></tr>`).join('')}</tbody></table></div></div>
  <div class="card section"><h2>併幾單後 D25 開始下降？</h2><div class="note">保留原分析表，作為上方建議的實際資料佐證。可搭配全域 RC／AC／餐廳／餐期篩選查看。</div><div class="tablewrap"><table><thead><tr><th>配送組合</th><th>趟次</th><th>訂單TC</th><th>D25</th><th>平均等餐</th><th>平均配送</th></tr></thead><tbody>${mergeRows.map(r=>`<tr><td>${r.name}</td><td>${r.trips}</td><td>${r.tc}</td><td>${fmt(r.d25)}%</td><td>${fmt(r.wait)}</td><td>${fmt(r.road)}</td></tr>`).join('')}</tbody></table></div></div>`;
 }
@@ -160,17 +174,27 @@ function renderCapacity(){
 function mergeStrategyRows(arr,byStore=false){
  let targets=targetValues(),groups=mergeGroups(arr.filter(x=>x.type==='own')),map={};
  groups.forEach(g=>{let d=g.map(x=>x.originalEta||x.orderTime).find(Boolean);if(!d)return;let tm=`${String(d.getHours()).padStart(2,'0')}:${d.getMinutes()<30?'00':'30'}`,key=byStore?`${g[0].store||'未分類'}|||${tm}`:tm;if(!map[key])map[key]=[];map[key].push(g)});
- return Object.entries(map).map(([key,gs])=>{let [store,time]=byStore?key.split('|||'):[null,key],stats=[1,2,3,4,5].map(size=>{let x=gs.filter(g=>size===5?g.length>=5:g.length===size),orders=x.flat(),dd=orders.filter(o=>o.isD25||o.isD25Late);return{size,trips:x.length,tc:orders.length,d25:dd.length?pct(dd.filter(o=>o.isD25).length,dd.length):null}}),observed=stats.filter(x=>x.trips>0&&Number.isFinite(x.d25)),passing=observed.filter(x=>x.d25>=targets.d25),best=null,rec='無可判斷資料',reason='此時段沒有可用的自有配送趟次。';
-  if(passing.length){best=passing.reduce((a,b)=>b.size>a.size?b:a);rec=best.size===1?'建議單送':best.size===2?'建議 2 單':best.size===3?'建議 3 單':best.size===4?'建議 4 單':'建議 ≥5 單';reason=`歷史觀察中，${best.size>=5?'≥5':best.size}單仍達 D25 ${fmt(best.d25)}%（${best.trips}趟），是在不低於 D25 ${fmt(targets.d25)}% 目標下可提高每趟承載的最高觀察層級。`;}
-  else if(observed.length){best=observed.reduce((a,b)=>b.d25>a.d25||(b.d25===a.d25&&b.size>a.size)?b:a);rec=best.size===1?'暫以單送':best.size===2?'暫以 2 單':best.size===3?'暫以 3 單':best.size===4?'暫以 4 單':'暫以 ≥5 單';reason=`此時段所有觀察層級都未達 D25 ${fmt(targets.d25)}%；目前 ${best.size>=5?'≥5':best.size}單的歷史 D25 ${fmt(best.d25)}% 最高。先採此層級作為歷史最優解，同時必須處理晚到、等餐或運能問題。`;}
-  let orders=gs.flat(),d=d25Rate(orders),avgSize=gs.length?orders.length/gs.length:null,score=orders.length+(Number.isFinite(d)?Math.max(0,targets.d25-d)*2:0);return{store,time,trips:gs.length,tc:orders.length,avgSize,d25:d,stats,rec,reason,best,score};
+ return Object.entries(map).map(([key,gs])=>{let [store,time]=byStore?key.split('|||'):[null,key],orders=gs.flat(),stats=[1,2,3,4,5].map(size=>{let x=gs.filter(g=>size===5?g.length>=5:g.length===size),oo=x.flat(),dd=oo.filter(o=>o.isD25||o.isD25Late);return{size,trips:x.length,tc:oo.length,d25:dd.length?pct(dd.filter(o=>o.isD25).length,dd.length):null}}),d=d25Rate(orders),wait=avg(orders,'storeWait'),dist=avg(orders,'distance'),avgSize=gs.length?orders.length/gs.length:null;
+  let safe=stats.filter(x=>x.size>=2&&x.trips>0&&Number.isFinite(x.d25)&&x.d25>=targets.d25),recSize=2;
+  let severeD25=Number.isFinite(d)&&d<targets.d25-8,severeWait=Number.isFinite(wait)&&wait>10,severeDist=Number.isFinite(dist)&&dist>4;
+  if(severeD25&&(severeWait||severeDist))recSize=1;
+  else if(safe.length)recSize=Math.min(4,Math.max(2,...safe.map(x=>x.size)));
+  else if(orders.length>=12&&(!Number.isFinite(d)||d>=targets.d25))recSize=4;
+  else if(orders.length>=7&&(!Number.isFinite(d)||d>=targets.d25))recSize=3;
+  let rec=recSize===1?'建議 1 單':`建議 ${recSize} 單`;
+  let reason;
+  if(recSize===1)reason=`目前 D25 ${fmt(d)}%，且${severeWait?'等餐偏高':''}${severeWait&&severeDist?'、':''}${severeDist?'距離偏長':''}，先單送保護D25；問題改善後再回到2單基準。`;
+  else if(recSize===2&&avgSize<2)reason=`以2單作為KPI改善基準；目前平均每趟 ${fmt(avgSize)}，有合適第二張訂單時優先併單提升TPLH，但不等待湊單而犧牲D25。`;
+  else if(safe.length)reason=`實際資料顯示最高可支持到 ${recSize} 單且D25仍達標；建議以此作為最大併單上限，持續監控等餐、距離與D25。`;
+  else reason=`目前以2單作為基本改善目標；現有資料未支持更高併單層級，先提升2單機會並觀察D25。`;
+  let score=orders.length+(Number.isFinite(d)?Math.max(0,targets.d25-d)*2:0)+(avgSize<2?20:0);return{store,time,trips:gs.length,tc:orders.length,avgSize,d25:d,stats,rec,reason,best:null,score};
  }).sort((a,b)=>a.time.localeCompare(b.time));
 }
 function mergeStatCell(r,size){let x=r.stats.find(v=>v.size===size);return x&&x.trips?`${fmt(x.d25)}% <span class="mini">(${x.trips}趟)</span>`:'-'}
 function renderMealMerge(){
  let ms=mergeStats(data),timeRows=mergeStrategyRows(data,false),storeRows=mergeStrategyRows(data,true),actionRows=storeRows.sort((a,b)=>b.score-a.score).slice(0,100);
  $('mealmerge').innerHTML=`<div class="grid kpis"><div class="card kpi"><div class="label">自有外送 TC</div><div class="value">${ms.own.toLocaleString()}</div></div><div class="card kpi"><div class="label">併單率</div><div class="value">${fmt(ms.mergeRate)}%</div></div><div class="card kpi"><div class="label">平均併單數</div><div class="value">${fmt(ms.avgMerge)}</div><div class="detail">單 / 併單趟</div></div></div>
- <div class="card section"><h2>30 分鐘時段：建議併幾單</h2><div class="note">決策重點：先守住 D25，再選擇歷史上可達標的最高併單層級，讓每趟承載提高以支持 TPLH。若所有層級都未達 D25，仍提供該時段歷史 D25 最佳的併單層級，同時提醒處理其他瓶頸；不再顯示「樣本不足」。</div><div class="tablewrap"><table><thead><tr><th>時段</th><th>TC</th><th>目前平均每趟</th><th>D25</th><th>建議併單</th><th>為什麼</th><th>單送</th><th>2單</th><th>3單</th><th>4單</th><th>≥5單</th></tr></thead><tbody>${timeRows.map(r=>`<tr><td><b>${r.time}</b></td><td>${r.tc}</td><td>${fmt(r.avgSize)}</td><td>${fmt(r.d25)}%</td><td><b>${esc(r.rec)}</b></td><td style="text-align:left;white-space:normal;min-width:360px">${esc(r.reason)}</td><td>${mergeStatCell(r,1)}</td><td>${mergeStatCell(r,2)}</td><td>${mergeStatCell(r,3)}</td><td>${mergeStatCell(r,4)}</td><td>${mergeStatCell(r,5)}</td></tr>`).join('')}</tbody></table></div></div>
+ <div class="card section"><h2>30 分鐘時段：建議併幾單</h2><div class="note">KPI改善邏輯：2單是基本改善目標；有合適第二張訂單時優先併單提升TPLH，但不等待湊單。只有明確D25／等餐／長距離風險才降為1單；資料支持時提高到3–4單。</div><div class="tablewrap"><table><thead><tr><th>時段</th><th>TC</th><th>目前平均每趟</th><th>D25</th><th>建議併單</th><th>為什麼</th><th>單送</th><th>2單</th><th>3單</th><th>4單</th><th>≥5單</th></tr></thead><tbody>${timeRows.map(r=>`<tr><td><b>${r.time}</b></td><td>${r.tc}</td><td>${fmt(r.avgSize)}</td><td>${fmt(r.d25)}%</td><td><b>${esc(r.rec)}</b></td><td style="text-align:left;white-space:normal;min-width:360px">${esc(r.reason)}</td><td>${mergeStatCell(r,1)}</td><td>${mergeStatCell(r,2)}</td><td>${mergeStatCell(r,3)}</td><td>${mergeStatCell(r,4)}</td><td>${mergeStatCell(r,5)}</td></tr>`).join('')}</tbody></table></div></div>
  <div class="card section"><h2>哪些餐廳需要不同併單策略</h2><div class="note">直接拆到餐廳 × 30分鐘。優先看「建議併單」與「為什麼」；右側各併單層級只作為分析依據。</div><div class="tablewrap"><table><thead><tr><th>餐廳</th><th>時段</th><th>TC</th><th>目前每趟</th><th>D25</th><th>建議併單</th><th>具體判斷</th><th>單送</th><th>2單</th><th>3單</th><th>4單</th><th>≥5單</th></tr></thead><tbody>${actionRows.map(r=>`<tr><td><b>${esc(r.store)}</b></td><td>${r.time}</td><td>${r.tc}</td><td>${fmt(r.avgSize)}</td><td>${fmt(r.d25)}%</td><td><b>${esc(r.rec)}</b></td><td style="text-align:left;white-space:normal;min-width:390px">${esc(r.reason)}</td><td>${mergeStatCell(r,1)}</td><td>${mergeStatCell(r,2)}</td><td>${mergeStatCell(r,3)}</td><td>${mergeStatCell(r,4)}</td><td>${mergeStatCell(r,5)}</td></tr>`).join('')}</tbody></table></div></div>`;
 }
 
