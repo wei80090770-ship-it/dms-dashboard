@@ -100,45 +100,85 @@ function qtOptScope(x,scope){return scope==='center'?(x.rc||'未分類中心'):s
 function qtOptDay(x){return x.orderTime.getDay()}
 function qtOptSlotIndex(d){return Math.floor((d.getHours()*60+d.getMinutes())/30)}
 function qtOptBin(d){return Math.floor((d.getHours()*60+d.getMinutes())/15)}
+function qtOrderKind(x){
+ if(!x.orderTime||!x.originalEta||!Number.isFinite(x.qt))return 'unknown';
+ const delta=Math.abs(mins(x.orderTime,x.originalEta)-(x.qt+10));
+ return delta<5?'instant':'reserved';
+}
+function qtWeekdayFilter(x,dayType){
+ if(!x.orderTime)return false;
+ const d=qtOptDay(x);
+ return dayType==='all'||(dayType==='weekday'&&d>=1&&d<=5)||(dayType==='weekend'&&(d===0||d===6))||(dayType.startsWith('w')&&d===Number(dayType.slice(1)))||dateKey(x.orderTime)===dayType;
+}
 function qtOptimizationRows(){
- const scope=document.getElementById('qtOptScope')?.value||'store', dayType=document.getElementById('qtOptDay')?.value||'all';
- const source=data.filter(x=>x.orderTime&&x.delivered&&x.delivered>=x.orderTime&&Number.isFinite(mins(x.orderTime,x.delivered))&&mins(x.orderTime,x.delivered)<=180)
- .filter(x=>dayType==='all'||(dayType==='weekday'?qtOptDay(x)>=1&&qtOptDay(x)<=5:dayType==='weekend'?qtOptDay(x)===0||qtOptDay(x)===6:dayType.startsWith('w')?qtOptDay(x)===Number(dayType.slice(1)):dateKey(x.orderTime)===dayType));
- const groups=groupBy(source,x=>qtOptScope(x,scope)+'|'+qtOptDay(x)+'|'+qtOptSlotIndex(x.orderTime));
- const byPlaceDay=groupBy(source,x=>qtOptScope(x,scope)+'|'+qtOptDay(x));
- const all=[];
- for(const [key,z] of Object.entries(groups)){
-  const parts=key.split('|'), slotIndex=Number(parts.pop()),weekday=Number(parts.pop()),place=parts.join('|');
-  const dur=z.map(x=>mins(x.orderTime,x.delivered)).sort((a,b)=>a-b), p85=dur[Math.ceil(dur.length*QT_TARGET)-1];
-  const candidate=QT_CHOICES.find(q=>dur.filter(v=>v<=q).length/dur.length>=QT_TARGET);
-  const actual=z.filter(x=>qtLate(x)!==null),late=actual.filter(x=>qtLate(x)===true).length;
-  const qtKnown=z.filter(x=>Number.isFinite(x.qt)),mean=qtKnown.length?qtKnown.reduce((a,x)=>a+x.qt,0)/qtKnown.length:null;
-  const [hh,mm]=[Math.floor(slotIndex/2),slotIndex%2*30],slot=String(hh).padStart(2,'0')+':'+String(mm).padStart(2,'0')+'–'+String(hh+Math.floor((mm+30)/60)).padStart(2,'0')+':'+String((mm+30)%60).padStart(2,'0');
-  all.push({place,weekday,slotIndex,slot,tc:z.length,qt:mean,p85,proposed:candidate??'>60',at25:dur.filter(v=>v<=25).length/dur.length*100,sim:candidate?dur.filter(v=>v<=candidate).length/dur.length*100:null,late,known:actual.length,orders:z,status:z.length<30?'樣本不足':candidate===undefined?'超出60分範圍':candidate>25?'建議評估延長':'可維持25分'});
+ const scope=document.getElementById('qtOptScope')?.value||'store',dayType=document.getElementById('qtOptDay')?.value||'all';
+ const source=data.filter(x=>x.orderTime&&qtWeekdayFilter(x,dayType)&&x.orderTime.getHours()>=11);
+ const allGroups=groupBy(source,x=>qtOptScope(x,scope)+'|'+qtOptDay(x));
+ const result=[];
+ for(const [key,dayOrders] of Object.entries(allGroups)){
+  const parts=key.split('|'),weekday=Number(parts.pop()),place=parts.join('|');
+  const instant=dayOrders.filter(x=>qtOrderKind(x)==='instant');
+  const reserved=dayOrders.filter(x=>qtOrderKind(x)==='reserved');
+  const unknown=dayOrders.filter(x=>qtOrderKind(x)==='unknown');
+  const validInstant=instant.filter(x=>x.delivered&&mins(x.orderTime,x.delivered)>=0&&mins(x.orderTime,x.delivered)<=180);
+  const slots=groupBy(instant,x=>qtOptSlotIndex(x.orderTime));
+  const historicalCompletion=groupBy(dayOrders.filter(x=>x.delivered),x=>dateKey(x.delivered)+'|'+qtOptBin(x.delivered));
+  const dates=[...new Set(dayOrders.map(x=>dateKey(x.orderTime)))];
+  const capacities=Array.from({length:96},(_,bin)=>{
+   const nums=dates.map(d=>(historicalCompletion[d+'|'+bin]||[]).length).sort((a,b)=>a-b);
+   return nums.length?nums[Math.floor((nums.length-1)*.75)]:0;
+  });
+  const slotRows=[];
+  for(const [slotKey,orders] of Object.entries(slots)){
+   const slotIndex=Number(slotKey),eligible=orders.filter(x=>validInstant.includes(x));
+   const durations=eligible.map(x=>mins(x.orderTime,x.delivered)).sort((a,b)=>a-b);
+   const p85=durations.length?durations[Math.ceil(durations.length*.85)-1]:null;
+   const rate=q=>durations.length?durations.filter(v=>v<=q+10).length/durations.length*100:null;
+   const choices=QT_CHOICES.filter(q=>rate(q)!==null&&rate(q)>=85);
+   const [hh,mm]=[Math.floor(slotIndex/2),slotIndex%2*30];
+   const slot=String(hh).padStart(2,'0')+':'+String(mm).padStart(2,'0')+'–'+String(hh+Math.floor((mm+30)/60)).padStart(2,'0')+':'+String((mm+30)%60).padStart(2,'0');
+   const qKnown=orders.filter(x=>Number.isFinite(x.qt));
+   slotRows.push({place,weekday,slotIndex,slot,tc:eligible.length,instantTC:orders.length,reservedTC:reserved.filter(x=>qtOptSlotIndex(x.originalEta)===slotIndex).length,unknownTC:unknown.length,qt:qKnown.length?qKnown.reduce((a,x)=>a+x.qt,0)/qKnown.length:null,p85,proposed:choices[0]??null,at25:rate(25),sim:null,orders:eligible,allInstant:orders,choices,concentration:'待評估',riskRatio:null,status:eligible.length<30?'樣本不足':choices.length?'可評估':'未達85%'});
+  }
+  // Fixed reserved-order promises are never moved by QT. Instant promises are order + QT + 10.
+  // Compare each historical date separately; don't sum weeks against a single-day capacity.
+  function score(){
+   const byDateBin=new Map();
+   for(const x of reserved){if(!x.originalEta)continue;const k=dateKey(x.originalEta)+'|'+qtOptBin(x.originalEta);byDateBin.set(k,(byDateBin.get(k)||0)+1)}
+   for(const r of slotRows){const q=typeof r.proposed==='number'?r.proposed:25;for(const x of r.allInstant){const promise=new Date(x.orderTime.getTime()+(q+10)*60000),k=dateKey(promise)+'|'+qtOptBin(promise);byDateBin.set(k,(byDateBin.get(k)||0)+1)}}
+   let overload=0,maxRatio=0,unreferenced=0;
+   for(const [key,n] of byDateBin){const bin=Number(key.split('|').pop()),cap=capacities[bin];if(cap<=0){unreferenced+=n;continue}const ratio=n/cap;maxRatio=Math.max(maxRatio,ratio);overload+=Math.max(0,n-cap)}
+   return {overload,maxRatio,unreferenced,metric:overload+maxRatio*2};
+  }
+  // Coordinate neighboring QT choices rather than optimizing each time slot in isolation.
+  for(let pass=0;pass<3;pass++){
+   let changed=false;
+   for(const r of slotRows){if(r.tc<30||!r.choices.length)continue;
+    const old=r.proposed;let best=old,bestScore=Infinity;
+    for(const q of r.choices){r.proposed=q;const v=score();const weighted=v.metric+q*.025;if(weighted<bestScore){best=q;bestScore=weighted}}
+    r.proposed=best;if(best!==old)changed=true;
+   }
+   if(!changed)break;
+  }
+  const overall=score();
+  for(const r of slotRows){
+   r.sim=typeof r.proposed==='number'?r.orders.filter(x=>mins(x.orderTime,x.delivered)<=r.proposed+10).length/r.tc*100:null;
+   r.concentration=overall.unreferenced?'參考不足':overall.maxRatio>1.2?'嚴重集中':overall.maxRatio>1?'集中風險':'正常';
+   r.riskRatio=overall.maxRatio;
+   if(r.tc<30){r.proposed=null;r.status='樣本不足（不提供正式建議）'}
+   else if(r.proposed===null)r.status='QT60仍未達85%';
+   else r.status=r.proposed===25?'維持25分':'建議評估延長';
+   if(r.tc>=30&&r.concentration!=='正常')r.status+='／'+r.concentration;
+   result.push(r);
+  }
  }
- // Evaluate promise-time concentration across adjacent order slots, not in isolation.
- // The observed completion count is a reference distribution, NOT verified rider capacity.
- const grouped=groupBy(all,r=>r.place+'|'+r.weekday);
- for(const rows of Object.values(grouped)){
-  const key=rows[0].place+'|'+rows[0].weekday,allOrders=byPlaceDay[key]||[];
-  const dates=[...new Set(allOrders.map(x=>dateKey(x.orderTime)))], completed=new Map();
-  for(const x of allOrders){const k=dateKey(x.delivered)+'|'+qtOptBin(x.delivered);completed.set(k,(completed.get(k)||0)+1)}
-  const binCounts=Array.from({length:96},(_,bin)=>dates.map(day=>completed.get(day+'|'+bin)||0));
-  const capacity=binCounts.map(z=>{const sorted=z.slice().sort((a,b)=>a-b);return sorted.length?sorted[Math.floor((sorted.length-1)*.75)]:0});
-  const baseline=rows.map(r=>r.proposed);
-  function risk(){const promised=new Map();for(const r of rows){if(typeof r.proposed!=='number')continue;for(const x of r.orders){const d=new Date(x.orderTime.getTime()+r.proposed*60000),k=dateKey(d)+'|'+qtOptBin(d);promised.set(k,(promised.get(k)||0)+1)}}let max=0,over=0,unknown=0;for(const [key,count] of promised){const bin=Number(key.split('|').pop()),cap=capacity[bin];if(!cap){unknown+=count;continue}const ratio=count/cap;if(ratio>max)max=ratio;if(ratio>1)over+=count}return {max,over,unknown}}
-  // Iteratively try only alternative QTs that meet 85%, optimizing the entire day.
-  // Avoid falsely claiming that moving promised times increases actual throughput.
-  for(let pass=0;pass<2;pass++){let changed=false;for(const r of rows){if(r.tc<30||typeof r.proposed!=='number')continue;const before=risk();let best=r.proposed,bestScore=before.over+before.max*2+r.proposed*.025;const durations=r.orders.map(x=>mins(x.orderTime,x.delivered));for(const q of QT_CHOICES){if(durations.filter(v=>v<=q).length/durations.length<QT_TARGET)continue;r.proposed=q;const test=risk(),score=test.over+test.max*2+q*.025;if(score<bestScore-0.01){best=q;bestScore=score}}r.proposed=best;if(best!==baseline[rows.indexOf(r)])changed=true}if(!changed)break}
-  const finalRisk=risk();for(const r of rows){r.concentration=finalRisk.unknown?'參考不足':finalRisk.max>1.2?'嚴重集中':finalRisk.max>1?'集中風險':'正常';r.riskRatio=finalRisk.max;r.sim=typeof r.proposed==='number'?r.orders.filter(x=>mins(x.orderTime,x.delivered)<=r.proposed).length/r.tc*100:null;if(r.tc>=30&&r.concentration!=='正常')r.status+='／'+r.concentration}
- }
- return all.sort((a,b)=>a.place.localeCompare(b.place,'zh-Hant')||a.weekday-b.weekday||a.slotIndex-b.slotIndex);
+ return result.sort((a,b)=>a.place.localeCompare(b.place,'zh-Hant')||a.weekday-b.weekday||a.slotIndex-b.slotIndex);
 }
 function renderQTOptimization(){
  const dates=[...new Set(data.filter(x=>x.orderTime).map(x=>dateKey(x.orderTime)))].sort().reverse();
  const prevScope=document.getElementById('qtOptScope')?.value||'store',prevDay=document.getElementById('qtOptDay')?.value||'all';
- const holder=`<div class="card section"><h2>QT 最適化決策｜目標準時率 85%</h2><div class="note">歷史模擬：QT 25–60 分鐘（每5分鐘），以85%承諾準時率為目標，並檢查相鄰時段每15分鐘的預計送達集中情形。集中參考基準為相同星期、時段的歷史實際完成 TC 第75百分位（非可用運能）；大於100%標示集中風險，大於120%為嚴重集中。無法保證調整 QT 能降低實際配送壅塞。每組少於30筆僅供觀察。</div><div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0"><label>分析層級 <select class="search" id="qtOptScope"><option value="store">餐廳</option><option value="group">中心 / Group</option><option value="center">中心</option></select></label><label>日期類型 <select class="search" id="qtOptDay"><option value="all">全部日期（依星期分列）</option>${['一','二','三','四','五','六','日'].map((d,i)=>`<option value="w${(i+1)%7}">星期${d}</option>`).join('')}<option value="weekday">平日（依星期分列）</option><option value="weekend">週末（依星期分列）</option>${dates.map(d=>`<option value="${d}">${d}</option>`).join('')}</select></label></div><div id="qtOptResults"></div></div>`;
- setTimeout(()=>{const a=document.getElementById('qtOptScope'),b=document.getElementById('qtOptDay');if(!a||!b)return;a.value=prevScope;b.value=[...b.options].some(o=>o.value===prevDay)?prevDay:'all';const update=()=>{const rows=qtOptimizationRows(),names=['日','一','二','三','四','五','六'];document.getElementById('qtOptResults').innerHTML=`<div class="note">${rows.length} 組星期時段；樣本充足 ${rows.filter(x=>x.tc>=30).length} 組。缺少實際送達時間或配送超過180分鐘不納入模擬；不代表實際QT調整後的因果效果。</div>`+qtStatTable(rows.map(x=>[x.place,'星期'+names[x.weekday],x.slot,x.tc,x.qt===null?'—':fmt(x.qt)+'分',fmt(x.p85)+'分',String(x.proposed)+(typeof x.proposed==='number'?'分':''),fmt(x.at25)+'%',x.sim===null?'未達標':fmt(x.sim)+'%',x.concentration||'—',x.status]),['中心 / Group / 餐廳','星期','落單時段','有效TC','歷史平均QT','配送P85','建議QT','QT25模擬準時率','建議QT模擬準時率','送達集中風險','判斷']);};a.onchange=update;b.onchange=update;update()},0);
+ const holder=`<div class="card section"><h2>QT 最適化決策｜85%｜即時＋預約訂單</h2><div class="note">即時判斷：|原預計送達－(落單＋原QT＋10分)| 小於5分鐘；其餘可辨識訂單暫列預約／待確認。只有即時單用於配送P85及85%準時率，模擬承諾時間＝落單＋模擬QT＋10分鐘；預約單固定原預計送達時間，納入每15分鐘集中風險。集中程度使用歷史完成量P75作參考，並非真實運能。樣本少於30筆不提供正式建議；僅分析11:00後落單即時單。</div><div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0"><label>分析層級 <select class="search" id="qtOptScope"><option value="store">餐廳</option><option value="group">中心 / Group</option><option value="center">中心</option></select></label><label>日期類型 <select class="search" id="qtOptDay"><option value="all">全部日期（依星期分列）</option>${['一','二','三','四','五','六','日'].map((d,i)=>`<option value="w${(i+1)%7}">星期${d}</option>`).join('')}<option value="weekday">平日（依星期分列）</option><option value="weekend">週末（依星期分列）</option>${dates.map(d=>`<option value="${d}">${d}</option>`).join('')}</select></label></div><div id="qtOptResults"></div></div>`;
+ setTimeout(()=>{const a=document.getElementById('qtOptScope'),b=document.getElementById('qtOptDay');if(!a||!b)return;a.value=prevScope;b.value=[...b.options].some(o=>o.value===prevDay)?prevDay:'all';const update=()=>{const rows=qtOptimizationRows(),names=['日','一','二','三','四','五','六'];document.getElementById('qtOptResults').innerHTML=`<div class="note">${rows.length} 組星期時段；有效即時單樣本達30筆 ${rows.filter(x=>x.tc>=30).length} 組。QT 模擬為歷史承諾時間情境，不代表實際配送運能增加。</div>`+qtStatTable(rows.map(x=>[x.place,'星期'+names[x.weekday],x.slot,x.instantTC,x.reservedTC,x.tc,x.qt===null?'—':fmt(x.qt)+'分',x.p85===null?'—':fmt(x.p85)+'分',x.proposed===null?'—':x.proposed+'分',x.at25===null?'—':fmt(x.at25)+'%',x.sim===null?'—':fmt(x.sim)+'%',x.concentration,x.status]),['中心 / Group / 餐廳','星期','即時單落單時段','即時TC','預約送達TC（同時段）','有效即時TC','歷史平均QT','即時配送P85','建議QT','QT25模擬準時率','建議QT模擬準時率','送達集中風險','判斷']);};a.onchange=update;b.onchange=update;update()},0);
  return holder;
 }
 
@@ -424,7 +464,7 @@ function exportPageWorkbook(mode){
   const el=$(id);if(!el)return;
   const tables=[...el.querySelectorAll('table')];tables.forEach((table,i)=>{const rows=toRows(table);if(rows.length)exportSheet(wb,uniqueSheet(pages[id]+'_明細'+(tables.length>1?i+1:'')),rows,{title:pages[id]+'｜明細（依目前篩選）'})});
   const canvases=[...el.querySelectorAll('canvas')];canvases.forEach((canvas,i)=>{const rows=graphRows(canvas);if(rows.length)exportSheet(wb,uniqueSheet(pages[id]+'_圖表'+(canvases.length>1?i+1:'')),chartNote(id,rows),{title:pages[id]+'｜圖表數據'})});
-  if(id==='orders'){const decision=qtOptimizationRows().map(x=>({'層級名稱':x.place,'星期':(['日','一','二','三','四','五','六'][x.weekday]),'落單時段':x.slot,'送達集中風險':x.concentration,'有效TC':x.tc,'歷史平均QT':x.qt,'實際配送P85':x.p85,'建議QT':x.proposed,'QT25模擬準時率':x.at25/100,'建議QT模擬準時率':x.sim===null?null:x.sim/100,'歷史承諾遲到TC':x.late,'可判斷承諾遲到TC':x.known,'判斷':x.status}));exportSheet(wb,uniqueSheet('QT_85星期建議'),decision,{title:'QT 85% 星期排程模擬（非因果預測）'});const validQT=data.filter(x=>x.qt!==null),nonQT=validQT.filter(x=>x.qt>25);const distribution=Object.entries(groupBy(validQT,x=>String(x.qt))).map(([q,z])=>({'QT分鐘':Number(q),'TC':z.length,'占有效QT比例':z.length/validQT.length})).sort((a,b)=>a.QT分鐘-b.QT分鐘);exportSheet(wb,uniqueSheet('QT_分鐘分布'),distribution,{title:'QT 分鐘分布'});const slotRows=Object.entries(groupBy(data.filter(x=>x.orderTime),x=>dateKey(x.orderTime)+'|'+qtSlot(x.orderTime))).map(([k,z])=>({'落單日期':k.split('|')[0],'30分鐘時段':k.split('|')[1],'總TC':z.length,'QT延長TC':z.filter(x=>x.qt!==null&&x.qt>25).length,'QT延長率':z.filter(x=>x.qt!==null&&x.qt>25).length/z.filter(x=>x.qt!==null).length,'平均QT分鐘':qtAverage(z).avg,'平均延長分鐘':qtAverage(z).extra,'主要QT分鐘':qtAverage(z).mode})).sort((a,b)=>(a.落單日期+a['30分鐘時段']).localeCompare(b.落單日期+b['30分鐘時段']));exportSheet(wb,uniqueSheet('QT_日期時段'),slotRows,{title:'QT 日期時段統計'});let rows=data.map(x=>({'日期':x.day,'落單時間':x.orderTime?x.orderTime.toLocaleString('zh-TW'):'','QT分鐘':x.qt,'QT狀態':x.qt===null?'未提供':x.qt===25?'25分鐘':'QT延長分鐘','訂單編號':x.orderId,'餐廳':x.store,'中心':x.rc,'Group':x.ac,'配送類型':x.type,'Rider':x.rider,'D25':x.d25,'晚指派':x.lateAssign?'是':'否','晚到店':x.lateArrive?'是':'否','餐廳改善等待':x.longWait?'是':'否','等餐分鐘':x.storeWait,'配送分鐘':x.road,'距離':x.distance}));exportSheet(wb,uniqueSheet('訂單分析_完整明細'),rows,{title:'訂單分析｜完整可編輯明細'})}
+  if(id==='orders'){const decision=qtOptimizationRows().map(x=>({'層級名稱':x.place,'星期':(['日','一','二','三','四','五','六'][x.weekday]),'落單時段':x.slot,'送達集中風險':x.concentration,'有效TC':x.tc,'即時TC':x.instantTC,'預約送達TC':x.reservedTC,'歷史平均QT':x.qt,'即時訂單配送P85':x.p85,'建議QT':x.proposed,'QT25模擬準時率':x.at25===null?null:x.at25/100,'建議QT模擬準時率':x.sim===null?null:x.sim/100,'歷史承諾遲到TC':x.late,'可判斷承諾遲到TC':x.known,'判斷':x.status}));exportSheet(wb,uniqueSheet('QT_85星期建議'),decision,{title:'QT 85% 即時與預約整合模擬（非因果預測）'});const validQT=data.filter(x=>x.qt!==null),nonQT=validQT.filter(x=>x.qt>25);const distribution=Object.entries(groupBy(validQT,x=>String(x.qt))).map(([q,z])=>({'QT分鐘':Number(q),'TC':z.length,'占有效QT比例':z.length/validQT.length})).sort((a,b)=>a.QT分鐘-b.QT分鐘);exportSheet(wb,uniqueSheet('QT_分鐘分布'),distribution,{title:'QT 分鐘分布'});const slotRows=Object.entries(groupBy(data.filter(x=>x.orderTime),x=>dateKey(x.orderTime)+'|'+qtSlot(x.orderTime))).map(([k,z])=>({'落單日期':k.split('|')[0],'30分鐘時段':k.split('|')[1],'總TC':z.length,'QT延長TC':z.filter(x=>x.qt!==null&&x.qt>25).length,'QT延長率':z.filter(x=>x.qt!==null&&x.qt>25).length/z.filter(x=>x.qt!==null).length,'平均QT分鐘':qtAverage(z).avg,'平均延長分鐘':qtAverage(z).extra,'主要QT分鐘':qtAverage(z).mode})).sort((a,b)=>(a.落單日期+a['30分鐘時段']).localeCompare(b.落單日期+b['30分鐘時段']));exportSheet(wb,uniqueSheet('QT_日期時段'),slotRows,{title:'QT 日期時段統計'});let rows=data.map(x=>({'日期':x.day,'落單時間':x.orderTime?x.orderTime.toLocaleString('zh-TW'):'','QT分鐘':x.qt,'QT狀態':x.qt===null?'未提供':x.qt===25?'25分鐘':'QT延長分鐘','訂單編號':x.orderId,'餐廳':x.store,'中心':x.rc,'Group':x.ac,'配送類型':x.type,'Rider':x.rider,'D25':x.d25,'晚指派':x.lateAssign?'是':'否','晚到店':x.lateArrive?'是':'否','餐廳改善等待':x.longWait?'是':'否','等餐分鐘':x.storeWait,'配送分鐘':x.road,'距離':x.distance}));exportSheet(wb,uniqueSheet('訂單分析_完整明細'),rows,{title:'訂單分析｜完整可編輯明細'})}
  });
  if(!wb.SheetNames.length){alert('目前篩選條件沒有可匯出的資料');return}
  const sd=$('startDate').value||'開始',ed=$('endDate').value||'結束';XLSX.writeFile(wb,`DMS_${mode==='page'?(pages[activePage()]||'目前頁面'):'全頁面'}_${sd}_${ed}.xlsx`);
